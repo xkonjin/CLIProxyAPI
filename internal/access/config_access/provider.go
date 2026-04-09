@@ -29,8 +29,10 @@ func Register(cfg *sdkconfig.SDKConfig) {
 }
 
 type provider struct {
-	name string
-	keys map[string]struct{}
+	name     string
+	keys     map[string]struct{}
+	prefixes []string // wildcard prefixes (e.g. "sk-ant-" from "sk-ant-*")
+	acceptAll bool    // true if "*" is in the key list
 }
 
 func newProvider(name string, keys []string) *provider {
@@ -39,10 +41,20 @@ func newProvider(name string, keys []string) *provider {
 		providerName = sdkaccess.DefaultAccessProviderName
 	}
 	keySet := make(map[string]struct{}, len(keys))
+	var prefixes []string
+	acceptAll := false
 	for _, key := range keys {
+		if key == "*" {
+			acceptAll = true
+			continue
+		}
+		if strings.HasSuffix(key, "*") {
+			prefixes = append(prefixes, strings.TrimSuffix(key, "*"))
+			continue
+		}
 		keySet[key] = struct{}{}
 	}
-	return &provider{name: providerName, keys: keySet}
+	return &provider{name: providerName, keys: keySet, prefixes: prefixes, acceptAll: acceptAll}
 }
 
 func (p *provider) Identifier() string {
@@ -89,7 +101,7 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		if candidate.value == "" {
 			continue
 		}
-		if _, ok := p.keys[candidate.value]; ok {
+		if p.matchKey(candidate.value) {
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
 				Principal: candidate.value,
@@ -101,6 +113,21 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 	}
 
 	return nil, sdkaccess.NewInvalidCredentialError()
+}
+
+func (p *provider) matchKey(key string) bool {
+	if p.acceptAll {
+		return true
+	}
+	if _, ok := p.keys[key]; ok {
+		return true
+	}
+	for _, prefix := range p.prefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractBearerToken(header string) string {
