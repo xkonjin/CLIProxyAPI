@@ -5,10 +5,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -322,6 +325,7 @@ func (s *Server) setupRoutes() {
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
+		v1.POST("/embeddings", s.handleEmbeddings)
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
@@ -1052,3 +1056,153 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}
 }
+
+// handleEmbeddings proxies OpenAI-compatible /v1/embeddings requests to the
+// appropriate configured OpenAICompatibility provider. Lookup: match the
+// request's `model` against each provider's Models[].Alias (or Models[].Name),
+// then POST the rawJSON to `{provider.BaseURL}/embeddings` using the first
+// configured API key for Authorization. Passes upstream response through
+// verbatim — OpenAI embeddings format is pass-through JSON with no streaming.
+func (s *Server) handleEmbeddings(c *gin.Context) {
+	rawJSON, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+			"message": fmt.Sprintf("Invalid request body: %v", err),
+			"type":    "invalid_request_error",
+		}})
+		return
+	}
+
+	// Extract model name (OpenAI embeddings: `{"model": "...", "input": "..."}`)
+	type embedReq struct {
+		Model string `json:"model"`
+	}
+	var req embedReq
+	if err := json.Unmarshal(rawJSON, &req); err != nil || req.Model == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+			"message": "Missing or invalid 'model' field",
+			"type":    "invalid_request_error",
+		}})
+		return
+	}
+
+	if s.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
+			"message": "server configuration unavailable",
+			"type":    "server_error",
+		}})
+		return
+	}
+
+	// Find a provider whose Models contains a matching alias OR name.
+	// Match is case-insensitive and tolerates the provider's Prefix.
+	var (
+		provider *config.OpenAICompatibility
+		resolved string
+	)
+	for i := range s.cfg.OpenAICompatibility {
+		p := &s.cfg.OpenAICompatibility[i]
+		for j := range p.Models {
+			m := p.Models[j]
+			candidates := []string{m.Alias, m.Name}
+			if p.Prefix != "" {
+				if m.Alias != "" {
+					candidates = append(candidates, p.Prefix+"/"+m.Alias, p.Prefix+"-"+m.Alias)
+				}
+				if m.Name != "" {
+					candidates = append(candidates, p.Prefix+"/"+m.Name, p.Prefix+"-"+m.Name)
+				}
+			}
+			for _, cand := range candidates {
+				if cand != "" && strings.EqualFold(cand, req.Model) {
+					provider = p
+					resolved = m.Name
+					break
+				}
+			}
+			if provider != nil {
+				break
+			}
+		}
+		if provider != nil {
+			break
+		}
+	}
+
+	if provider == nil || provider.BaseURL == "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": fmt.Sprintf("unknown provider for model %s", req.Model),
+			"type":    "server_error",
+			"code":    "internal_server_error",
+		}})
+		return
+	}
+
+	// Rewrite the model name in the forwarded body if the alias differs from the
+	// upstream's actual model name, so Ollama (or any compat backend) receives
+	// the name it knows.
+	forwardBody := rawJSON
+	if resolved != "" && !strings.EqualFold(resolved, req.Model) {
+		forwardBody = []byte(strings.Replace(
+			string(rawJSON),
+			`"model":"`+req.Model+`"`,
+			`"model":"`+resolved+`"`,
+			1,
+		))
+		// Also handle the case with a space after the colon (OpenAI SDK style).
+		forwardBody = []byte(strings.Replace(
+			string(forwardBody),
+			`"model": "`+req.Model+`"`,
+			`"model": "`+resolved+`"`,
+			1,
+		))
+	}
+
+	// Build upstream URL.
+	base := strings.TrimRight(provider.BaseURL, "/")
+	url := base + "/embeddings"
+
+	upstreamReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, url, bytes.NewReader(forwardBody))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{
+			"message": fmt.Sprintf("failed to build upstream request: %v", err),
+			"type":    "server_error",
+		}})
+		return
+	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	if len(provider.APIKeyEntries) > 0 && provider.APIKeyEntries[0].APIKey != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+provider.APIKeyEntries[0].APIKey)
+	}
+	for k, v := range provider.Headers {
+		upstreamReq.Header.Set(k, v)
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	upstreamResp, err := client.Do(upstreamReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": fmt.Sprintf("upstream embeddings call failed: %v", err),
+			"type":    "server_error",
+		}})
+		return
+	}
+	defer func() { _ = upstreamResp.Body.Close() }()
+
+	respBody, err := io.ReadAll(upstreamResp.Body)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": fmt.Sprintf("failed to read upstream response: %v", err),
+			"type":    "server_error",
+		}})
+		return
+	}
+
+	// Pass through content type + status.
+	if ct := upstreamResp.Header.Get("Content-Type"); ct != "" {
+		c.Header("Content-Type", ct)
+	}
+	c.Writer.WriteHeader(upstreamResp.StatusCode)
+	_, _ = c.Writer.Write(respBody)
+}
+
